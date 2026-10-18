@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+.env
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+
+# Uploaded and generated images (keep folder structure only)
+public/images/items/*
+public/images/generated/*
+!public/images/items/.gitkeep
+!public/images/generated/.gitkeep

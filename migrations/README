@@ -1,0 +1,12 @@
+Alembic migrations for the outfit recommendation backend.
+
+Common commands (jalankan dari root proyek, env py312 aktif):
+
+  alembic upgrade head          # terapkan semua migration
+  alembic downgrade -1          # mundur satu migration
+  alembic revision --autogenerate -m "pesan"   # buat migration dari perubahan model
+  alembic current               # lihat revisi aktif
+  alembic history               # lihat riwayat
+
+Database URL diambil otomatis dari app.config (dari .env), jadi tidak ada
+kredensial yang disimpan di alembic.ini.
