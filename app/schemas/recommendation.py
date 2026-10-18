@@ -26,6 +26,9 @@ class RecommendationResponse(BaseModel):
     generated_image_path: str | None = Field(
         None, description="Relative path of the composed outfit preview, null if it failed"
     )
+    generated_image_url: str | None = Field(
+        None, description="Full URL of the composed outfit preview, null if it failed"
+    )
     image_editing_error: str | None = Field(
         None, description="Error message if visualization failed, otherwise null"
     )

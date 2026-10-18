@@ -1,7 +1,7 @@
 """Outfit recommendation endpoint."""
 import logging
 
-from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile, status
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, UploadFile, status
 from sqlalchemy.orm import Session
 
 from app.database import get_db
@@ -19,6 +19,7 @@ router = APIRouter(prefix="/api/v1/recommendations", tags=["recommendations"])
 
 @router.post("", response_model=RecommendationResponse)
 async def create_recommendation(
+    request: Request,
     image: UploadFile | None = File(
         None,
         description=(
@@ -97,17 +98,19 @@ async def create_recommendation(
             detail=f"Gagal menghasilkan rekomendasi: {exc}",
         )
 
+    base_url = str(request.base_url)
     chosen_items = result["chosen_items"]
     reasons: dict[int, str] = result["reasons"]
-    recommended = [
-        RecommendedItem(
-            item=ItemRead.model_validate(it),
-            reason=reasons.get(it.id, "Dipilih oleh AI."),
+    recommended = []
+    for it in chosen_items:
+        item_read = ItemRead.model_validate(it)
+        item_read.image_url = storage_service.build_public_url(base_url, it.image_path)
+        recommended.append(
+            RecommendedItem(item=item_read, reason=reasons.get(it.id, "Dipilih oleh AI."))
         )
-        for it in chosen_items
-    ]
     total_price = result["total_price"]
 
+    generated_path = result["generated_image_path"]
     return RecommendationResponse(
         items=recommended,
         total_price=total_price,
@@ -116,6 +119,7 @@ async def create_recommendation(
         overall_reasoning=result["overall_reasoning"],
         photo_analysis=result.get("photo_analysis", ""),
         mode=mode,
-        generated_image_path=result["generated_image_path"],
+        generated_image_path=generated_path,
+        generated_image_url=storage_service.build_public_url(base_url, generated_path),
         image_editing_error=result["image_editing_error"],
     )

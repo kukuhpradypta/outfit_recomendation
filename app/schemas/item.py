@@ -21,5 +21,8 @@ class ItemRead(ItemBase):
 
     id: int
     category: CategoryRead
-    image_path: str
+    image_path: str = Field(..., description="Path relatif gambar di public/")
+    image_url: str | None = Field(
+        None, description="URL lengkap gambar produk (diisi backend)"
+    )
     created_at: datetime

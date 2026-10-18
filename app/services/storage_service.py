@@ -76,3 +76,20 @@ def absolute_path(relative_path: str) -> Path:
 def read_bytes(relative_path: str) -> bytes:
     with open(absolute_path(relative_path), "rb") as f:
         return f.read()
+
+
+# Static files are mounted at this prefix in main.py.
+PUBLIC_URL_PREFIX = "public"
+
+
+def build_public_url(base_url: str, relative_path: str | None) -> str | None:
+    """Turn a public-relative path into a full URL using the request base URL.
+
+    base_url example: "http://localhost:8000/" -> returns
+    "http://localhost:8000/public/images/generated/xxx.png".
+    """
+    if not relative_path:
+        return None
+    base = base_url.rstrip("/")
+    rel = relative_path.lstrip("/")
+    return f"{base}/{PUBLIC_URL_PREFIX}/{rel}"
