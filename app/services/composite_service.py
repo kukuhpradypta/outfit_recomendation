@@ -30,17 +30,10 @@ logger = logging.getLogger(__name__)
 CANVAS_W = 720
 CANVAS_H = 1080
 BG_COLOR = (245, 246, 248)
-MANNEQUIN_COLOR = (208, 213, 221)
-MANNEQUIN_OUTLINE = (176, 182, 192)
+MANNEQUIN_COLOR = (210, 215, 223)
+MANNEQUIN_OUTLINE = (182, 188, 198)
 
-# Zones: (center_x_ratio, center_y_ratio, max_w, max_h).
-# Sizes are generous so garments overlap the body for a "worn" look.
-UPPER_ZONE = (0.5, 0.36, 300, 320)
-OUTER_ZONE = (0.5, 0.36, 360, 360)
-LOWER_ZONE = (0.5, 0.68, 300, 400)
-FEET_ZONE = (0.5, 0.91, 210, 140)
-HEAD_ZONE = (0.5, 0.10, 170, 150)
-SIDE_ZONE_X = 0.86
+SIDE_ZONE_X = 0.86          # x position (ratio) of the accessory side panel
 
 CATEGORY_KEYWORDS = {
     "outer": ["luaran", "outer", "jacket", "jaket", "coat", "mantel", "cardigan"],
@@ -146,11 +139,26 @@ def _keep_largest_component(img: Image.Image) -> Image.Image:
         return img
 
 
+def _clean_edges(img: Image.Image) -> Image.Image:
+    """Remove the faint grey halo/shadow left around a cutout.
+
+    Drops weak alpha (soft shadows) and shrinks the mask by 1px so the edge
+    sits cleanly on the garment.
+    """
+    from PIL import ImageFilter
+
+    r, g, b, a = img.split()
+    a = a.point(lambda v: 0 if v < 110 else v)
+    a = a.filter(ImageFilter.MinFilter(3))
+    return Image.merge("RGBA", (r, g, b, a))
+
+
 def _cutout(img: Image.Image) -> Image.Image:
     """Remove background, drop stray marks, then auto-crop transparent margins."""
     result = _remove_bg_rembg(img)
     if result is None:
         result = _remove_bg_threshold(img)
+    result = _clean_edges(result)
     result = _keep_largest_component(result)
     bbox = result.getbbox()
     if bbox:
@@ -186,6 +194,19 @@ def _fit_to_width(img: Image.Image, target_w: int, max_h: int) -> Image.Image:
     return img.resize((new_w, new_h), Image.LANCZOS)
 
 
+def _fit_cover_width(img: Image.Image, target_w: int) -> Image.Image:
+    """Scale to exactly target_w (keeping ratio), ignoring height.
+
+    Guarantees the garment is at least target_w wide so it always covers the
+    mannequin body underneath (no shoulders peeking out).
+    """
+    img = img.copy()
+    scale = target_w / img.width
+    new_w = max(1, int(img.width * scale))
+    new_h = max(1, int(img.height * scale))
+    return img.resize((new_w, new_h), Image.LANCZOS)
+
+
 def _paste_center(canvas: Image.Image, img: Image.Image, cx: int, cy: int) -> None:
     x = int(cx - img.width / 2)
     y = int(cy - img.height / 2)
@@ -211,40 +232,242 @@ def _paste_anchored(
     canvas.paste(img, (x, y), img)
 
 
-def _draw_mannequin(canvas: Image.Image) -> None:
-    d = ImageDraw.Draw(canvas)
-    cx = CANVAS_W // 2
-    d.ellipse([cx - 52, 60, cx + 52, 165], fill=MANNEQUIN_COLOR, outline=MANNEQUIN_OUTLINE, width=3)
-    d.rectangle([cx - 20, 160, cx + 20, 205], fill=MANNEQUIN_COLOR)
-    d.polygon(
-        [(cx - 115, 210), (cx + 115, 210), (cx + 92, 580), (cx - 92, 580)],
-        fill=MANNEQUIN_COLOR, outline=MANNEQUIN_OUTLINE,
-    )
-    d.polygon([(cx - 115, 215), (cx - 150, 500), (cx - 116, 505), (cx - 90, 250)], fill=MANNEQUIN_COLOR)
-    d.polygon([(cx + 115, 215), (cx + 150, 500), (cx + 116, 505), (cx + 90, 250)], fill=MANNEQUIN_COLOR)
-    d.polygon([(cx - 92, 580), (cx - 16, 580), (cx - 26, 980), (cx - 82, 980)], fill=MANNEQUIN_COLOR)
-    d.polygon([(cx + 92, 580), (cx + 16, 580), (cx + 26, 980), (cx + 82, 980)], fill=MANNEQUIN_COLOR)
+def _detect_person_bbox(photo_rgba: Image.Image) -> tuple[int, int, int, int] | None:
+    """Return (left, top, right, bottom) of the person in the photo, or None."""
+    cut = _remove_bg_rembg(photo_rgba.copy())
+    if cut is None:
+        return None
+    cut = _keep_largest_component(cut)
+    return cut.getbbox()
 
 
-def _zone_point(zone: tuple[float, float, int, int]) -> tuple[int, int, int, int]:
-    rx, ry, mw, mh = zone
-    return int(rx * CANVAS_W), int(ry * CANVAS_H), mw, mh
-
-
-def _base_canvas_mannequin() -> Image.Image:
+def _base_canvas_user(user_image: bytes) -> tuple[Image.Image, tuple[int, int, int, int]]:
+    """Place the user's photo on the canvas and return the person box in canvas
+    coordinates (left, top, right, bottom)."""
+    area_h = CANVAS_H - CAPTION_H
     canvas = Image.new("RGBA", (CANVAS_W, CANVAS_H), BG_COLOR + (255,))
-    _draw_mannequin(canvas)
+    photo = Image.open(io.BytesIO(user_image)).convert("RGBA")
+    photo = _fit(photo, CANVAS_W, area_h)
+    px = (CANVAS_W - photo.width) // 2
+    py = (area_h - photo.height) // 2
+    canvas.paste(photo, (px, py), photo)
+
+    bbox = _detect_person_bbox(photo)
+    if bbox:
+        box = (bbox[0] + px, bbox[1] + py, bbox[2] + px, bbox[3] + py)
+    else:
+        # Person not detected: assume a centred person filling the photo height.
+        box = (px + int(photo.width * 0.3), py, px + int(photo.width * 0.7), py + photo.height)
+    return canvas, box
+
+
+def _is_glasses(piece: OutfitPiece) -> bool:
+    name = f"{piece.category_name} {piece.name}".lower()
+    return any(k in name for k in ("kacamata", "glasses", "sunglasses"))
+
+
+# ------------------------------------------------------------ mannequin mode
+# Proportions relative to the reference top width W (unscaled figure space).
+REF_W = 300                 # reference width of the top garment
+HEAD_R_RATIO = 0.155        # head radius = W * ratio
+NECK_H_RATIO = 0.035        # visible neck height = W * ratio
+PANTS_W_RATIO = 0.68        # pants width vs top width (hips < shoulders)
+SHOE_W_RATIO = 0.64         # width of the shoe pair vs top width
+TUCK_RATIO = 0.07           # pants waist overlaps top hem by this * top height
+SHOE_OVERLAP_RATIO = 0.38   # pants hem covers this share of the shoe height
+PANTS_MAX_H_RATIO = 1.38    # pants height cap vs top height (natural leg length)
+PANTS_MIN_H_RATIO = 1.15    # pants height floor vs top height
+FIG_MARGIN_TOP = 40
+FIG_MARGIN_BOTTOM = 30      # gap kept above the caption bar
+CAPTION_H = 46
+
+
+def _scale_to_height(img: Image.Image, target_h: int) -> Image.Image:
+    s = target_h / img.height
+    return img.resize((max(1, int(img.width * s)), max(1, target_h)), Image.LANCZOS)
+
+
+def _compose_on_mannequin(pieces: list[OutfitPiece]) -> Image.Image:
+    """Stack garments head-to-toe, draw a mannequin fitted behind them, then
+    scale the whole figure to fit the frame (nothing can be cut off)."""
+    W = REF_W
+    tops: dict[str, Image.Image] = {}
+    head_items: list[tuple[OutfitPiece, Image.Image]] = []
+    side_items: list[Image.Image] = []
+    for piece in pieces:
+        zone = _classify(piece)
+        img = _load_cutout(piece.image_rel_path)
+        if img is None:
+            continue
+        if zone in ("upper", "outer", "lower", "feet"):
+            tops.setdefault(zone, img)
+        elif zone == "head":
+            head_items.append((piece, img))
+        else:
+            side_items.append(img)
+
+    top = _fit_cover_width(tops["upper"], W) if "upper" in tops else None
+    outer = _fit_cover_width(tops["outer"], int(W * 1.08)) if "outer" in tops else None
+    main_top = outer or top
+    top_h = main_top.height if main_top else int(W * 1.05)
+
+    pants = None
+    if "lower" in tops:
+        pants = _fit_cover_width(tops["lower"], int(W * PANTS_W_RATIO))
+        # Keep a natural torso:leg ratio regardless of the product photo.
+        max_h = int(top_h * PANTS_MAX_H_RATIO)
+        min_h = int(top_h * PANTS_MIN_H_RATIO)
+        if pants.height > max_h:
+            pants = _scale_to_height(pants, max_h)
+        elif pants.height < min_h:
+            pants = _scale_to_height(pants, min_h)
+    pants_h = pants.height if pants else int(top_h * 1.45)
+
+    shoes = _fit_cover_width(tops["feet"], int(W * SHOE_W_RATIO)) if "feet" in tops else None
+    shoe_h = shoes.height if shoes else int(W * 0.18)
+
+    head_r = int(W * HEAD_R_RATIO)
+    neck_h = int(W * NECK_H_RATIO)
+
+    # Vertical stacking in unscaled figure space (y grows downwards).
+    head_top = int(head_r * 0.6) if head_items else 0      # room for a hat
+    head_cy = head_top + head_r
+    top_y = head_cy + head_r + neck_h                       # collar line
+    top_bottom = top_y + top_h
+    pants_y = top_bottom - int(top_h * TUCK_RATIO)
+    pants_bottom = pants_y + pants_h
+    shoe_y = pants_bottom - int(shoe_h * SHOE_OVERLAP_RATIO)
+    fig_h = shoe_y + shoe_h
+
+    widths = [W, int(W * 1.1)]
+    if outer:
+        widths.append(outer.width)
+    fig_w = max(widths) + 40
+    fcx = fig_w // 2
+
+    fig = Image.new("RGBA", (fig_w, fig_h), (0, 0, 0, 0))
+    d = ImageDraw.Draw(fig)
+
+    # --- mannequin body (drawn first, stays hidden behind the clothes) -----
+    neck_half = int(head_r * 0.58)
+    d.rectangle([fcx - neck_half, head_cy, fcx + neck_half, top_y + int(top_h * 0.15)],
+                fill=MANNEQUIN_COLOR)
+    torso_half = int(W * 0.24)   # narrower than the shirt body -> never peeks out
+    d.polygon([(fcx - torso_half, top_y + int(top_h * 0.10)),
+               (fcx + torso_half, top_y + int(top_h * 0.10)),
+               (fcx + int(torso_half * 0.9), top_bottom),
+               (fcx - int(torso_half * 0.9), top_bottom)], fill=MANNEQUIN_COLOR)
+    if pants is None:
+        leg_half = int(W * 0.10)
+        for sx in (-1, 1):
+            lx = fcx + sx * int(W * 0.12)
+            d.polygon([(lx - leg_half, pants_y), (lx + leg_half, pants_y),
+                       (lx + int(leg_half * 0.7), shoe_y + 10),
+                       (lx - int(leg_half * 0.7), shoe_y + 10)], fill=MANNEQUIN_COLOR)
+    d.ellipse([fcx - head_r, head_cy - head_r, fcx + head_r, head_cy + head_r],
+              fill=MANNEQUIN_COLOR, outline=MANNEQUIN_OUTLINE, width=3)
+
+    # --- garments: shoes, pants, top, outer (so the top covers the pants waist)
+    if shoes:
+        fig.paste(shoes, (fcx - shoes.width // 2, shoe_y), shoes)
+    if pants:
+        fig.paste(pants, (fcx - pants.width // 2, pants_y), pants)
+    if top:
+        fig.paste(top, (fcx - top.width // 2, top_y), top)
+    if outer:
+        fig.paste(outer, (fcx - outer.width // 2, top_y - 4), outer)
+
+    # Head accessories: glasses at eye level, hats on top of the head.
+    for piece, img in head_items:
+        if _is_glasses(piece):
+            g = _fit_cover_width(img, int(head_r * 2.1))
+            fig.paste(g, (fcx - g.width // 2, head_cy - int(head_r * 0.15) - g.height // 2), g)
+        else:
+            h = _fit_cover_width(img, int(head_r * 2.5))
+            fig.paste(h, (fcx - h.width // 2, head_cy - int(head_r * 0.35) - h.height), h)
+
+    # --- scale the whole figure to fit the frame ---------------------------
+    avail_h = CANVAS_H - CAPTION_H - FIG_MARGIN_TOP - FIG_MARGIN_BOTTOM
+    avail_w = CANVAS_W - (220 if side_items else 60)
+    scale = min(avail_h / fig.height, avail_w / fig.width)
+    fig = fig.resize((max(1, int(fig.width * scale)), max(1, int(fig.height * scale))),
+                     Image.LANCZOS)
+
+    canvas = Image.new("RGBA", (CANVAS_W, CANVAS_H), BG_COLOR + (255,))
+    fig_x = (CANVAS_W - fig.width) // 2 - (70 if side_items else 0)
+    fig_y = FIG_MARGIN_TOP + (avail_h - fig.height) // 2
+    canvas.paste(fig, (fig_x, fig_y), fig)
+
+    # Other accessories (not head-worn) stacked in a side panel.
+    for i, img in enumerate(side_items):
+        s = _fit(img, 150, 120)
+        _paste_center(canvas, s, int(SIDE_ZONE_X * CANVAS_W), 200 + i * 150)
     return canvas
 
 
-def _base_canvas_user(user_image: bytes) -> Image.Image:
-    canvas = Image.new("RGBA", (CANVAS_W, CANVAS_H), BG_COLOR + (255,))
-    try:
-        photo = Image.open(io.BytesIO(user_image)).convert("RGBA")
-        photo = _fit(photo, CANVAS_W, CANVAS_H)
-        _paste_center(canvas, photo, CANVAS_W // 2, CANVAS_H // 2)
-    except Exception:
-        _draw_mannequin(canvas)
+# ----------------------------------------------------------- user photo mode
+# Landmarks as a fraction of the person's height (head top = 0, feet = 1).
+PHOTO_COLLAR_Y = 0.13       # top of the shirt collar
+PHOTO_TOP_HEM_Y = 0.53      # bottom hem of the top
+PHOTO_WAIST_Y = 0.47        # pants waistband
+PHOTO_ANKLE_Y = 0.95        # pants hem
+PHOTO_HEAD_CY = 0.065       # head centre
+PHOTO_HEAD_R = 0.065        # head radius
+
+
+def _compose_on_user_photo(pieces: list[OutfitPiece], user_image: bytes) -> Image.Image:
+    """Dress the person in the user's photo, sizing each garment from the
+    person's detected height so proportions match the body."""
+    canvas, (l, t, r, b) = _base_canvas_user(user_image)
+    h = b - t
+    cx = (l + r) // 2
+
+    cuts: dict[str, Image.Image] = {}
+    head_items: list[tuple[OutfitPiece, Image.Image]] = []
+    side_items: list[Image.Image] = []
+    for piece in pieces:
+        zone = _classify(piece)
+        img = _load_cutout(piece.image_rel_path)
+        if img is None:
+            continue
+        if zone in ("upper", "outer", "lower", "feet"):
+            cuts.setdefault(zone, img)
+        elif zone == "head":
+            head_items.append((piece, img))
+        else:
+            side_items.append(img)
+
+    collar_y = t + int(PHOTO_COLLAR_Y * h)
+    top_h = int((PHOTO_TOP_HEM_Y - PHOTO_COLLAR_Y) * h)
+    top_img = cuts.get("outer") or cuts.get("upper")
+    top = _scale_to_height(top_img, top_h) if top_img else None
+    ref_w = top.width if top else int(h * 0.30)
+
+    if "feet" in cuts:
+        shoes = _fit_cover_width(cuts["feet"], int(ref_w * SHOE_W_RATIO))
+        if shoes.height > int(h * 0.09):
+            shoes = _scale_to_height(shoes, int(h * 0.09))
+        canvas.paste(shoes, (cx - shoes.width // 2, b - shoes.height), shoes)
+    if "lower" in cuts:
+        waist_y = t + int(PHOTO_WAIST_Y * h)
+        pants = _scale_to_height(cuts["lower"], int((PHOTO_ANKLE_Y - PHOTO_WAIST_Y) * h))
+        canvas.paste(pants, (cx - pants.width // 2, waist_y), pants)
+    if top:
+        canvas.paste(top, (cx - top.width // 2, collar_y), top)
+
+    head_cy = t + int(PHOTO_HEAD_CY * h)
+    head_r = int(PHOTO_HEAD_R * h)
+    for piece, img in head_items:
+        if _is_glasses(piece):
+            g = _fit_cover_width(img, int(head_r * 2.1))
+            canvas.paste(g, (cx - g.width // 2, head_cy - int(head_r * 0.15) - g.height // 2), g)
+        else:
+            hat = _fit_cover_width(img, int(head_r * 2.5))
+            canvas.paste(hat, (cx - hat.width // 2, head_cy - int(head_r * 0.35) - hat.height), hat)
+
+    for i, img in enumerate(side_items):
+        s = _fit(img, 150, 120)
+        _paste_center(canvas, s, int(SIDE_ZONE_X * CANVAS_W), 200 + i * 150)
     return canvas
 
 
@@ -256,51 +479,9 @@ def build_outfit_image(
 ) -> str:
     """Compose an outfit preview and return its public-relative path."""
     if mode == "user_photo" and user_image:
-        canvas = _base_canvas_user(user_image)
+        canvas = _compose_on_user_photo(pieces, user_image)
     else:
-        canvas = _base_canvas_mannequin()
-
-    cx = CANVAS_W // 2
-
-    # Fixed body anchor lines (y px on the mannequin). Garments overlap here so
-    # there is no gap between top and bottom.
-    SHOULDER_Y = 215          # top of torso
-    WAIST_Y = 470             # where top ends and bottom begins (overlap point)
-    PANTS_BOTTOM_Y = 930      # ankle line
-    HEAD_CENTER_Y = 112
-
-    side_count = 0
-    # Draw order: lower first, then upper, then outer on top.
-    order = {"lower": 0, "upper": 1, "outer": 2, "feet": 0, "head": 0, "side": 0}
-    for piece in sorted(pieces, key=lambda p: order.get(_classify(p), 0)):
-        zone = _classify(piece)
-        img = _load_cutout(piece.image_rel_path)
-        if img is None:
-            continue
-
-        if zone in ("upper", "outer"):
-            # Top: fill torso width; anchor BOTTOM just below the waist.
-            target_w = 300 if zone == "upper" else 350
-            fitted = _fit_to_width(img, target_w, max_h=360)
-            _paste_anchored(canvas, fitted, cx, WAIST_Y + 25, anchor="bottom")
-        elif zone == "lower":
-            # Pants: fill the leg width like the top; anchor TOP at the waist so
-            # it overlaps the top's hem. Cap height to reach the ankle line.
-            fitted = _fit_to_width(img, 250, max_h=PANTS_BOTTOM_Y - WAIST_Y + 50)
-            _paste_anchored(canvas, fitted, cx, WAIST_Y - 10, anchor="top")
-        elif zone == "feet":
-            # Shoes: anchor top near the ankle (slightly up to avoid a gap).
-            fitted = _fit(img, 220, 150)
-            _paste_anchored(canvas, fitted, cx, PANTS_BOTTOM_Y - 35, anchor="top")
-        elif zone == "head":
-            fitted = _fit(img, 170, 150)
-            _paste_center(canvas, fitted, cx, HEAD_CENTER_Y)
-        else:  # side panel, stacked
-            scx = int(SIDE_ZONE_X * CANVAS_W)
-            scy = int(0.22 * CANVAS_H) + side_count * 150
-            fitted = _fit(img, 170, 130)
-            _paste_center(canvas, fitted, scx, scy)
-            side_count += 1
+        canvas = _compose_on_mannequin(pieces)
 
     # Caption
     d = ImageDraw.Draw(canvas)
@@ -308,9 +489,8 @@ def build_outfit_image(
         font = ImageFont.truetype("arial.ttf", 22)
     except OSError:
         font = ImageFont.load_default()
-    label = "Pratinjau Outfit"
-    d.rectangle([0, CANVAS_H - 46, CANVAS_W, CANVAS_H], fill=(255, 255, 255, 235))
-    d.text((20, CANVAS_H - 38), label, fill=(60, 60, 60), font=font)
+    d.rectangle([0, CANVAS_H - CAPTION_H, CANVAS_W, CANVAS_H], fill=(255, 255, 255, 235))
+    d.text((20, CANVAS_H - 38), "Pratinjau Outfit", fill=(60, 60, 60), font=font)
 
     out = canvas.convert("RGB")
     buf = io.BytesIO()

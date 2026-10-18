@@ -11,8 +11,7 @@ Run:
 from pathlib import Path
 
 from docx import Document
-from docx.enum.text import WD_ALIGN_PARAGRAPH
-from docx.shared import Pt, RGBColor
+from docx.shared import Pt
 
 OUTPUT = Path(
     r"C:\Folder Kuliah\Semester 5\KECERDASAN BUATAN"

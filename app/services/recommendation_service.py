@@ -19,7 +19,7 @@ from collections.abc import Sequence
 
 from app.models import Item
 from app.repositories.item_repository import ItemRepository
-from app.services import composite_service, storage_service
+from app.services import composite_service
 from app.services.gemini_client import get_gemini_client
 
 logger = logging.getLogger(__name__)
