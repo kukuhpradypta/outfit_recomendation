@@ -16,10 +16,11 @@ from app.config import settings
 
 logger = logging.getLogger(__name__)
 
-# Transient server statuses worth retrying.
-_RETRYABLE_STATUS = {429, 500, 503}
-_MAX_RETRIES = 3
-_BASE_DELAY_SEC = 2.0
+# Transient server statuses worth retrying. Kept short: a customer is waiting,
+# and the recommendation service has a deterministic fallback.
+_RETRYABLE_STATUS = {500, 503}
+_MAX_RETRIES = 2
+_BASE_DELAY_SEC = 1.0
 
 
 @dataclass
@@ -32,13 +33,29 @@ class GeminiClient:
     def __init__(self) -> None:
         if not settings.gemini_api_key:
             raise RuntimeError("GEMINI_API_KEY belum diset di environment.")
-        self._client = genai.Client(api_key=settings.gemini_api_key)
+        self._client = genai.Client(
+            api_key=settings.gemini_api_key,
+            http_options=types.HttpOptions(timeout=settings.gemini_timeout_sec * 1000),
+        )
         self.text_model = settings.gemini_text_model
         self.image_model = settings.gemini_image_model
+        # Disabled automatically if the configured model rejects thinking_level.
+        self._thinking_level = (settings.gemini_thinking_level or "").strip().upper() or None
+
+    def _json_config(self, max_output_tokens: int) -> types.GenerateContentConfig:
+        """JSON config with a capped output size and a low thinking level."""
+        kwargs = dict(
+            response_mime_type="application/json",
+            temperature=0.4,
+            max_output_tokens=max_output_tokens,
+        )
+        if self._thinking_level:
+            kwargs["thinking_config"] = types.ThinkingConfig(thinking_level=self._thinking_level)
+        return types.GenerateContentConfig(**kwargs)
 
     # --------------------------------------------------------------- retry
     def _generate_with_retry(self, *, contents, config):
-        """Call generate_content, retrying transient 429/500/503 errors."""
+        """Call generate_content, retrying transient 500/503 errors."""
         last_exc: Exception | None = None
         for attempt in range(_MAX_RETRIES):
             try:
@@ -47,6 +64,16 @@ class GeminiClient:
                 )
             except genai_errors.APIError as exc:
                 status = getattr(exc, "code", None) or getattr(exc, "status_code", None)
+                # Model does not support thinking_level: drop it and retry once.
+                if (
+                    status == 400
+                    and config.thinking_config is not None
+                    and "think" in str(exc).lower()
+                ):
+                    logger.warning("Model menolak thinking_level, dinonaktifkan: %s", exc)
+                    self._thinking_level = None
+                    config = config.model_copy(update={"thinking_config": None})
+                    continue
                 if status in _RETRYABLE_STATUS and attempt < _MAX_RETRIES - 1:
                     delay = _BASE_DELAY_SEC * (2 ** attempt)
                     logger.warning(
@@ -62,14 +89,10 @@ class GeminiClient:
         raise RuntimeError("Gemini tidak merespons.")
 
     # ------------------------------------------------------------------ text
-    def generate_json(self, prompt: str) -> dict:
+    def generate_json(self, prompt: str, max_output_tokens: int = 1024) -> dict:
         """Call the text model and parse a JSON object from the response."""
         response = self._generate_with_retry(
-            contents=prompt,
-            config=types.GenerateContentConfig(
-                response_mime_type="application/json",
-                temperature=0.4,
-            ),
+            contents=prompt, config=self._json_config(max_output_tokens),
         )
         text = (response.text or "").strip()
         if not text:
@@ -77,7 +100,7 @@ class GeminiClient:
         return self._parse_json(text)
 
     def generate_json_with_image(
-        self, *, prompt: str, image: bytes, image_mime: str
+        self, *, prompt: str, image: bytes, image_mime: str, max_output_tokens: int = 1024
     ) -> dict:
         """Call the text model with an image (vision) and parse JSON output."""
         response = self._generate_with_retry(
@@ -90,10 +113,7 @@ class GeminiClient:
                     ],
                 )
             ],
-            config=types.GenerateContentConfig(
-                response_mime_type="application/json",
-                temperature=0.4,
-            ),
+            config=self._json_config(max_output_tokens),
         )
         text = (response.text or "").strip()
         if not text:

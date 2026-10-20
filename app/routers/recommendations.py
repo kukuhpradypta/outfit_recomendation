@@ -3,6 +3,7 @@ import logging
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, UploadFile, status
 from sqlalchemy.orm import Session
+from starlette.concurrency import run_in_threadpool
 
 from app.database import get_db
 from app.repositories.item_repository import ItemRepository
@@ -84,7 +85,10 @@ async def create_recommendation(
         raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(exc))
 
     try:
-        result = service.recommend(
+        # The Gemini call and image work are blocking; run them in a worker
+        # thread so other customers' requests are not stuck behind this one.
+        result = await run_in_threadpool(
+            service.recommend,
             user_image=user_bytes,
             user_image_mime=user_mime,
             budget=budget_value,

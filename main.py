@@ -1,5 +1,6 @@
 """FastAPI application entry point for the AI Outfit Recommendation backend."""
 import logging
+import threading
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -9,7 +10,7 @@ from fastapi.staticfiles import StaticFiles
 
 from app.config import settings
 from app.routers import categories, items, recommendations
-from app.services import storage_service
+from app.services import composite_service, storage_service
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -20,6 +21,9 @@ async def lifespan(app: FastAPI):
     # Schema is managed by Alembic (run `alembic upgrade head`). Here we only
     # ensure the image directories exist.
     storage_service.ensure_dirs()
+    # Load the background-removal model in the background so the first
+    # recommendation does not pay the ~5s model load.
+    threading.Thread(target=composite_service.warm_up, daemon=True).start()
     logger.info("Startup complete. Text model=%s, Image model=%s",
                 settings.gemini_text_model, settings.gemini_image_model)
     yield

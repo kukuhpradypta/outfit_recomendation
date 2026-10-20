@@ -231,6 +231,18 @@ Contoh respons:
 Field `generated_image_path` berisi path pratinjau outfit (manekin atau foto).
 Akses gambarnya via `http://localhost:8000/public/<generated_image_path>`.
 
+## Performa
+- Katalog di-shortlist lokal sebelum dikirim ke Gemini: maksimal
+  `RECO_MAX_PER_CATEGORY` item per kategori, diurutkan dari relevansi kata kunci
+  prompt dan tersebar di rentang harga. Format prompt ringkas (bukan JSON).
+- Analisis foto, pemilihan produk, dan penjelasan dilakukan dalam **satu**
+  panggilan Gemini, dengan `GEMINI_THINKING_LEVEL=low` dan batas waktu
+  `GEMINI_TIMEOUT_SEC`. Jika Gemini lambat/gagal, fallback budget dipakai.
+- Model rembg dimuat saat startup, dan hasil hapus-background produk di-cache
+  di memori, sehingga komposit gambar hanya butuh puluhan milidetik.
+- Endpoint rekomendasi berjalan di thread pool, jadi request pelanggan lain
+  tidak antre di belakang panggilan Gemini.
+
 ## Jaminan Anti-Halusinasi
 - AI hanya menerima katalog dari DB dan hanya boleh memilih `id` yang ada; ID
   karangan otomatis dibuang.

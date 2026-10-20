@@ -15,6 +15,13 @@ class Settings(BaseSettings):
     gemini_api_key: str = ""
     gemini_text_model: str = "gemini-flash-latest"
     gemini_image_model: str = "gemini-2.5-flash-image"
+    # Reasoning depth for Gemini 3.x models: minimal/low/medium/high. Lower is
+    # faster. Leave empty to use the model default.
+    gemini_thinking_level: str = "low"
+    # Per-request timeout so a slow Gemini call never hangs the API.
+    gemini_timeout_sec: int = 30
+    # Max candidate items per category sent to Gemini (keeps the prompt small).
+    reco_max_per_category: int = 8
 
     # App
     app_host: str = "0.0.0.0"

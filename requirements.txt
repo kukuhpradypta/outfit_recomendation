@@ -6,7 +6,7 @@ pydantic==2.10.4
 pydantic-settings==2.7.0
 python-multipart==0.0.20
 python-dotenv==1.0.1
-google-genai==0.8.0
+google-genai==1.75.0
 scalar-fastapi==1.0.3
 Pillow==11.1.0
 alembic==1.20.0

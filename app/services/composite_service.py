@@ -19,7 +19,9 @@ from __future__ import annotations
 
 import io
 import logging
+import threading
 from dataclasses import dataclass
+from functools import lru_cache
 
 from PIL import Image, ImageDraw, ImageFont
 
@@ -60,9 +62,14 @@ _BODY_ZONE_MAP = {
     "accessory": "head",
 }
 
-# Lazily-created rembg session (loaded once).
+# Lazily-created rembg session (loaded once, shared across request threads).
 _rembg_session = None
 _rembg_failed = False
+_rembg_lock = threading.Lock()
+
+# Cutout results cached in memory: product images never change (unique file
+# names), so background removal only runs once per product per process.
+_CUTOUT_CACHE_SIZE = 512
 
 
 def _classify(piece: "OutfitPiece") -> str:
@@ -79,16 +86,34 @@ def _classify(piece: "OutfitPiece") -> str:
 
 
 # ---------------------------------------------------------------- bg removal
+def _get_rembg_session():
+    global _rembg_session
+    if _rembg_session is None:
+        with _rembg_lock:
+            if _rembg_session is None:
+                from rembg import new_session
+
+                _rembg_session = new_session("u2netp")  # lighter model
+    return _rembg_session
+
+
+def warm_up() -> None:
+    """Load the rembg model ahead of time (called at app startup)."""
+    try:
+        _get_rembg_session()
+        logger.info("rembg siap.")
+    except Exception as exc:
+        logger.warning("Warm-up rembg gagal: %s", exc)
+
+
 def _remove_bg_rembg(img: Image.Image) -> Image.Image | None:
-    global _rembg_session, _rembg_failed
+    global _rembg_failed
     if _rembg_failed:
         return None
     try:
-        from rembg import remove, new_session
+        from rembg import remove
 
-        if _rembg_session is None:
-            _rembg_session = new_session("u2netp")  # lighter model
-        out = remove(img, session=_rembg_session)
+        out = remove(img, session=_get_rembg_session())
         return out.convert("RGBA")
     except Exception as exc:
         logger.warning("rembg tidak tersedia, pakai fallback: %s", exc)
@@ -166,7 +191,9 @@ def _cutout(img: Image.Image) -> Image.Image:
     return result
 
 
+@lru_cache(maxsize=_CUTOUT_CACHE_SIZE)
 def _load_cutout(rel_path: str) -> Image.Image | None:
+    """Background-removed product image (cached; callers must not mutate it)."""
     try:
         data = storage_service.read_bytes(rel_path)
         img = Image.open(io.BytesIO(data)).convert("RGBA")
