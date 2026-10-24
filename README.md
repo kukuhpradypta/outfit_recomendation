@@ -294,7 +294,11 @@ kesalahan sekaligus:
   berbasis aturan: atasan, bawahan, dan alas kaki yang paling cocok dengan kata
   kunci prompt, gender konsisten, bukan produk anak (kecuali diminta), dan
   masuk budget.
-- Topi dan kacamata hanya dipilih jika prompt memintanya (mis. "pakai topi").
+- Jenis produk mengikuti prompt. "carikan baju formal" hanya memilih atasan;
+  "celana dan sepatu" memilih bawahan + alas kaki; "topi" hanya topi. Jika
+  prompt tidak menyebut jenis produk, atau memakai kata seperti "outfit" /
+  "setelan", sistem memilih atasan + bawahan + alas kaki. Topi dan kacamata
+  hanya dipilih jika disebut (atau "aksesoris").
 - Model rembg dimuat saat startup, dan hasil hapus-background produk di-cache
   di memori, sehingga komposit gambar hanya butuh puluhan milidetik.
 - Endpoint rekomendasi berjalan di thread pool, jadi request pelanggan lain

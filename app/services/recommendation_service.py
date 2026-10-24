@@ -58,11 +58,6 @@ _STYLE_SYNONYMS = {
 }
 _WORD_RE = re.compile(r"[a-zA-Z]+")
 
-# Words that mean the user explicitly wants a hat / glasses.
-_ACCESSORY_WORDS = {
-    "topi", "kacamata", "aksesori", "aksesoris", "accessory", "accessories",
-    "cap", "hat", "glasses", "sunglasses",
-}
 # Prompt words -> gender used in the dataset descriptions.
 _GENDER_WORDS = {
     "pria": "men", "cowok": "men", "laki": "men", "lelaki": "men", "men": "men", "man": "men",
@@ -94,8 +89,50 @@ def _prompt_words(extra_prompt: str | None) -> set[str]:
     return {w.lower() for w in _WORD_RE.findall(extra_prompt or "")}
 
 
-def wants_accessories(extra_prompt: str | None) -> bool:
-    return bool(_prompt_words(extra_prompt) & _ACCESSORY_WORDS)
+# Prompt words that name a specific slot. "baju" is used in everyday
+# Indonesian for a top/shirt, so it maps to the top slot.
+_SLOT_WORDS: dict[str, set[str]] = {
+    "upper": {"baju", "atasan", "kemeja", "kaos", "kaus", "blus", "blouse", "shirt", "shirts",
+              "tshirt", "tshirts", "top", "tops", "sweater", "hoodie", "sweatshirt", "kurta",
+              "jaket", "jacket", "polo"},
+    "lower": {"bawahan", "celana", "rok", "jeans", "pants", "trousers", "shorts", "legging",
+              "leggings", "skirt"},
+    "feet": {"sepatu", "sendal", "sandal", "sandals", "shoes", "sneakers", "heels", "alas"},
+    "accessory:topi": {"topi", "cap", "hat"},
+    "accessory:kacamata": {"kacamata", "glasses", "sunglasses"},
+}
+# Words that ask for a whole look rather than a single item.
+_FULL_OUTFIT_WORDS = {"outfit", "setelan", "paket", "lengkap", "look", "penampilan", "pakaian"}
+_ALL_ACCESSORY_WORDS = {"aksesori", "aksesoris", "accessory", "accessories"}
+_SLOT_LABELS = {
+    "upper": "1 atasan",
+    "lower": "1 bawahan",
+    "feet": "1 alas kaki (sepatu ATAU sendal, bukan keduanya)",
+    "accessory:topi": "1 topi",
+    "accessory:kacamata": "1 kacamata",
+}
+
+
+def requested_slots(extra_prompt: str | None) -> set[str]:
+    """Which outfit slots the user asked for.
+
+    "carikan baju formal" -> {"upper"}; "celana dan sepatu" -> {"lower", "feet"};
+    no item named, or words like "outfit" -> top + bottom + footwear (plus any
+    accessory that is mentioned).
+    """
+    words = _prompt_words(extra_prompt)
+    slots = {s for s, ws in _SLOT_WORDS.items() if words & ws}
+    if words & _ALL_ACCESSORY_WORDS:
+        slots |= {"accessory:topi", "accessory:kacamata"}
+    if not slots or words & _FULL_OUTFIT_WORDS:
+        slots |= set(_CORE_SLOTS)
+    return slots
+
+
+def slot_group(item: Item) -> str:
+    """slot_key, with jackets ('outer') counted as the top slot."""
+    key = slot_key(item)
+    return "upper" if key == "outer" else key
 
 
 def _prompt_gender(extra_prompt: str | None) -> str | None:
@@ -233,12 +270,15 @@ class RecommendationService:
         user_image_mime: str,
         excluded: Sequence[Combination] = (),
         refresh: bool = False,
+        slots: set[str] | None = None,
     ) -> dict:
-        """Single Gemini call: analyse photo (if any), select items, explain."""
-        accessories = wants_accessories(extra_prompt)
-        if not accessories:
-            # Do not even show hats/glasses to the model when they were not asked for.
-            candidates = [c for c in candidates if not slot_key(c).startswith("accessory:")]
+        """Single Gemini call: analyse photo (if any), select items, explain.
+
+        `candidates` must already be limited to the requested `slots`.
+        """
+        slots = slots or set(_CORE_SLOTS)
+        order = ["upper", "lower", "feet", "accessory:topi", "accessory:kacamata"]
+        wanted = ", ".join(_SLOT_LABELS[s] for s in order if s in slots)
         photo_rule = (
             '- Analisis foto pengguna terlampir (tone kulit, penampilan) dan isi "photo_analysis" 1 kalimat.\n'
             if user_image else
@@ -253,14 +293,13 @@ class RecommendationService:
                 f"- JANGAN ulangi kombinasi id berikut persis sama: {combos}. "
                 "Boleh memakai sebagian item yang sama asalkan kombinasinya berbeda.\n"
             )
-        prompt = f"""Kamu fashion stylist. Pilih SATU set outfit dari KATALOG.
+        prompt = f"""Kamu fashion stylist. Pilih produk dari KATALOG sesuai permintaan pengguna.
 
 ATURAN:
 - Hanya pakai "id" yang ada di KATALOG. Jangan mengarang produk atau harga.
 - Total harga TIDAK BOLEH melebihi budget {int(budget)}.
-- Pilih 1 atasan, 1 bawahan, dan 1 alas kaki (sepatu ATAU sendal, bukan keduanya).
-- {"Topi/kacamata boleh ditambahkan sesuai permintaan pengguna." if accessories else "JANGAN pilih topi atau kacamata karena pengguna tidak memintanya."}
-- Semua item harus cocok untuk acara/gaya yang diminta (mis. acara formal: kemeja/celana formal/sepatu formal, bukan sandal jepit atau legging).
+- Pilih TEPAT: {wanted}. Jangan memilih jenis produk lain.
+- Semua item harus cocok untuk acara/gaya yang diminta (mis. acara formal: kemeja, celana formal, sepatu formal; bukan kaos olahraga, sandal jepit, atau legging).
 - Gunakan gender yang konsisten untuk seluruh item (lihat "Gender" pada deskripsi); hindari produk anak kecuali diminta.
 - Warna dapat disimpulkan dari nama/deskripsi.
 - Jangan menyebut harga atau total harga di "reason" maupun "overall_reasoning" (total dihitung sistem).
@@ -331,9 +370,9 @@ Balas HANYA JSON:
         def strength(slot: str) -> int:
             return max(_relevance(i, terms) for i in by_slot[slot])
 
+        # `catalog` is already limited to the requested slots.
         slots = sorted((s for s in _CORE_SLOTS if by_slot.get(s)), key=strength, reverse=True)
-        if wants_accessories(extra_prompt):
-            slots += sorted(s for s in by_slot if s.startswith("accessory:"))
+        slots += sorted(s for s in by_slot if s.startswith("accessory:"))
 
         def good(i: Item) -> bool:
             return _gender_ok(i, gender) and (allow_kids or not _is_kids(i))
@@ -389,19 +428,22 @@ Balas HANYA JSON:
         rng: random.Random | None,
         rank=None,
     ) -> tuple[list[Item], set[int]]:
-        """Fill missing core slots (top, bottom, footwear) within budget.
+        """Fill requested slots that are still empty, within budget.
 
-        Used when the AI omits a slot or its pick was rejected. Candidates
-        from the shortlist are tried before the rest of the catalog; on a
-        refresh the choice is random among items that fit, otherwise the
-        cheapest one is taken. Returns (items, ids_that_were_added).
+        `catalog` is already limited to the requested slots, so only those are
+        filled (asking for "baju" never adds pants). Used when the AI omits a
+        slot or its pick was rejected. Shortlist candidates are tried before
+        the rest of the catalog; on a refresh the choice is random among the
+        best-ranked items that fit. Returns (items, ids_that_were_added).
         """
-        core = [("upper", "outer"), ("lower",), ("feet",)]
+        groups = sorted({slot_group(i) for i in catalog},
+                        key=lambda g: _SWAP_ORDER.get(g.split(":")[0], 9))
+        core = [(g,) for g in groups]
         added: set[int] = set()
         result = list(items)
 
         def zone_of(i: Item) -> str:
-            return i.category.body_zone if i.category else ""
+            return slot_group(i)
 
         def best(cands: list[Item]) -> Item:
             if rank is not None:
@@ -457,7 +499,6 @@ Balas HANYA JSON:
         budget: float,
         excluded: set[Combination],
         rng: random.Random,
-        allow_accessories: bool = False,
         rank=None,
     ) -> tuple[list[Item], set[int]]:
         """Return an outfit whose item set is not in `excluded`.
@@ -500,13 +541,10 @@ Balas HANYA JSON:
             *_, new_items, alt = max(options, key=lambda o: o[:3])
             return new_items, {alt.id}
 
-        # 2) Add a slot that is not in the outfit yet (accessories only if asked).
+        # 2) Add a requested slot that is not in the outfit yet (`catalog` only
+        #    contains requested slots).
         used = {slot_key(i) for i in items}
-        extras = [
-            a for s, lst in by_slot.items()
-            if s not in used and (allow_accessories or not s.startswith("accessory:"))
-            for a in lst
-        ]
+        extras = [a for s, lst in by_slot.items() if s not in used for a in lst]
         rng.shuffle(extras)
         if rank is not None:
             extras.sort(key=rank, reverse=True)
@@ -517,10 +555,26 @@ Balas HANYA JSON:
         return items, set()
 
     @staticmethod
+    def _interpret_previous(
+        combos: Sequence[Combination], slots: set[str]
+    ) -> set[Combination]:
+        """Turn the client's previous combinations into the set to avoid.
+
+        When several product types are requested but every entry holds one
+        ID, the client most likely split ONE previous outfit into one field
+        per ID (common with array inputs in API GUIs), so they are merged.
+        For a single product type, one-ID entries are separate previous picks.
+        """
+        if len(slots) > 1 and len(combos) > 1 and all(len(c) == 1 for c in combos):
+            return {frozenset().union(*combos)}
+        return set(combos)
+
+    @staticmethod
     def _default_reasoning(items: Sequence[Item], extra_prompt: str | None) -> str:
         names = ", ".join(it.name for it in items)
         style = f" untuk kebutuhan '{extra_prompt}'" if extra_prompt else ""
-        return f"Kombinasi {names} dipilih{style} dan tetap sesuai budget Anda."
+        what = "Kombinasi" if len(items) > 1 else "Produk"
+        return f"{what} {names} dipilih{style} dan tetap sesuai budget Anda."
 
     # ------------------------------------------------------- orchestrate
     def recommend(
@@ -547,7 +601,23 @@ Balas HANYA JSON:
                 "combination": [], "notice": None,
             }
 
-        excluded = set(previous_combinations)
+        # Only the slots the user asked for take part from here on: the AI
+        # never sees other products, and the server never adds them.
+        slots = requested_slots(extra_prompt)
+        catalog = [i for i in catalog if slot_group(i) in slots]
+        if not catalog:
+            return {
+                "chosen_items": [], "reasons": {}, "total_price": 0.0,
+                "photo_analysis": "",
+                "overall_reasoning": (
+                    "Tidak ada produk untuk jenis yang diminta dengan harga di bawah budget "
+                    f"{budget}. Coba naikkan budget atau ubah prompt."
+                ),
+                "generated_image_path": None, "image_editing_error": None,
+                "combination": [], "notice": None,
+            }
+
+        excluded = self._interpret_previous(previous_combinations, slots)
         rng = random.Random() if refresh else None
         candidates = self.shortlist_candidates(
             catalog, extra_prompt, settings.reco_max_per_category, rng=rng
@@ -559,7 +629,7 @@ Balas HANYA JSON:
             result = self.ask_ai(
                 candidates=candidates, budget=budget, extra_prompt=extra_prompt,
                 user_image=user_image, user_image_mime=user_image_mime,
-                excluded=list(excluded), refresh=refresh,
+                excluded=list(excluded), refresh=refresh, slots=slots,
             )
             chosen_ids, reasons = self._parse_selection(result, valid)
             photo_analysis = str(result.get("photo_analysis", "") or "").strip()
@@ -592,21 +662,19 @@ Balas HANYA JSON:
             chosen_items, candidates, catalog, budget, rng, rank=rank
         )
         for item_id in filled:
-            reasons[item_id] = "Ditambahkan untuk melengkapi outfit (atasan, bawahan, alas kaki)."
+            reasons[item_id] = "Ditambahkan agar semua jenis produk yang diminta terpenuhi."
         if filled and overall:
             if before <= {i.id for i in chosen_items}:
                 # AI picks kept: just mention what the server added.
                 names = ", ".join(i.name for i in chosen_items if i.id in filled)
-                overall = f"{overall} Sistem menambahkan {names} agar outfit lengkap dan tetap sesuai budget."
+                overall = f"{overall} Sistem menambahkan {names} agar permintaan lengkap dan tetap sesuai budget."
             else:
                 overall = ""  # an AI pick was replaced; its text no longer matches
 
         notice = None
         if excluded:
             chosen_items, swapped = self.ensure_new_combination(
-                chosen_items, catalog, budget, excluded, rng or random.Random(),
-                allow_accessories=wants_accessories(extra_prompt),
-                rank=rank,
+                chosen_items, catalog, budget, excluded, rng or random.Random(), rank=rank,
             )
             if swapped:
                 overall = ""  # the AI text describes the outfit before the swap

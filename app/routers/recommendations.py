@@ -24,11 +24,8 @@ def _parse_combinations(raw: list[str] | None) -> list[frozenset[int]]:
     """Parse ['12,45,78', '13,45,80'] into id sets. Empty entries are ignored.
 
     A single field may also hold several combinations separated by ';'.
-
-    If every entry is a single ID (e.g. the field was repeated once per ID, as
-    array inputs in API GUIs tend to do), the IDs are treated as ONE
-    combination, since a one-item "outfit" list like that is almost always
-    meant as the previous outfit split into parts.
+    (Entries of one ID each are interpreted by the service, which knows how
+    many product types were requested.)
     """
     combos: list[frozenset[int]] = []
     for entry in raw or []:
@@ -45,8 +42,6 @@ def _parse_combinations(raw: list[str] | None) -> list[frozenset[int]]:
                 )
             if ids:
                 combos.append(ids)
-    if len(combos) > 1 and all(len(c) == 1 for c in combos):
-        combos = [frozenset().union(*combos)]
     if len(combos) > _MAX_PREVIOUS_COMBINATIONS:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
