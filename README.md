@@ -37,6 +37,7 @@ hanya alat menggambar hasilnya.
 │   ├── models.py                 # ORM: tabel `category` & `item`
 │   ├── routers/
 │   │   ├── items.py              # POST/GET /api/v1/items
+│   │   ├── outfits.py            # POST /api/v1/outfits/try-on
 │   │   └── recommendations.py    # POST /api/v1/recommendations
 │   ├── schemas/                  # Pydantic request/response
 │   ├── repositories/             # Akses data `item`
@@ -231,13 +232,69 @@ Contoh respons:
 Field `generated_image_path` berisi path pratinjau outfit (manekin atau foto).
 Akses gambarnya via `http://localhost:8000/public/<generated_image_path>`.
 
+### Refresh rekomendasi (minta opsi lain)
+Setiap respons rekomendasi memuat field `combination` (daftar ID item, terurut).
+Untuk meminta kombinasi lain, kirim ulang request dengan `refresh=true` dan
+kombinasi yang sudah pernah ditampilkan di `previous_combinations`:
+```bash
+curl -X POST http://localhost:8000/api/v1/recommendations \
+  -F "budget=1000000" \
+  -F "prompt=outfit hangout gaya keren" \
+  -F "mode=mannequin" \
+  -F "refresh=true" \
+  -F "previous_combinations=327,346,363" \
+  -F "previous_combinations=327,350,363"
+```
+Satu nilai `previous_combinations` = satu outfit lengkap (`327,346,363`). Jika
+setiap nilai hanya berisi satu ID (mis. field diulang per ID dari GUI), semua ID
+itu dianggap satu kombinasi.
+
+Hasil dijamin tidak sama persis dengan kombinasi mana pun di
+`previous_combinations`. Sebagian item boleh sama (mis. bawahan sama, atasan
+berbeda). Jika tidak ada kombinasi baru yang masuk budget, field `notice` berisi
+penjelasannya. Maksimal 20 kombinasi; satu field juga boleh berisi beberapa
+kombinasi yang dipisah `;`.
+
+### `POST /api/v1/outfits/try-on`
+Pratinjau outfit dari item pilihan pengguna (multipart/form-data). Isi minimal
+satu dari: `atasan_id`, `bawahan_id`, `alas_kaki_id`, `kacamata_id`, `topi_id`,
+ditambah `mode` (`mannequin`/`user_photo`) dan `image` (wajib untuk `user_photo`).
+
+Validasi kategori per slot:
+| Field | Kategori yang diterima |
+|---|---|
+| `atasan_id` | body_zone `upper`/`outer` (atasan, luaran) |
+| `bawahan_id` | body_zone `lower` (bawahan) |
+| `alas_kaki_id` | body_zone `feet` (sepatu dan sendal) |
+| `kacamata_id` | kategori `kacamata` |
+| `topi_id` | kategori `topi` |
+
+```bash
+curl -X POST http://localhost:8000/api/v1/outfits/try-on \
+  -F "atasan_id=298" -F "bawahan_id=334" -F "alas_kaki_id=295" \
+  -F "kacamata_id=314" -F "topi_id=342" -F "mode=mannequin"
+```
+Jika ID tidak ada atau kategorinya tidak sesuai slot, respons 422 berisi semua
+kesalahan sekaligus:
+```json
+{"detail": {"message": "Validasi outfit gagal.", "errors": [
+  {"field": "kacamata_id", "message": "Item 298 ('...') berkategori 'atasan', bukan kacamata. Kategori yang diterima: kacamata."}
+]}}
+```
+
 ## Performa
 - Katalog di-shortlist lokal sebelum dikirim ke Gemini: maksimal
   `RECO_MAX_PER_CATEGORY` item per kategori, diurutkan dari relevansi kata kunci
   prompt dan tersebar di rentang harga. Format prompt ringkas (bukan JSON).
 - Analisis foto, pemilihan produk, dan penjelasan dilakukan dalam **satu**
   panggilan Gemini, dengan `GEMINI_THINKING_LEVEL=low` dan batas waktu
-  `GEMINI_TIMEOUT_SEC`. Jika Gemini lambat/gagal, fallback budget dipakai.
+  `GEMINI_TIMEOUT_SEC` per model. Jika model utama timeout atau sibuk
+  (429/503/504), model di `GEMINI_FALLBACK_MODELS` dicoba berurutan, dan model
+  yang gagal dilewati selama 5 menit. Jika semua gagal, dipakai fallback
+  berbasis aturan: atasan, bawahan, dan alas kaki yang paling cocok dengan kata
+  kunci prompt, gender konsisten, bukan produk anak (kecuali diminta), dan
+  masuk budget.
+- Topi dan kacamata hanya dipilih jika prompt memintanya (mis. "pakai topi").
 - Model rembg dimuat saat startup, dan hasil hapus-background produk di-cache
   di memori, sehingga komposit gambar hanya butuh puluhan milidetik.
 - Endpoint rekomendasi berjalan di thread pool, jadi request pelanggan lain

@@ -17,6 +17,43 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/v1/recommendations", tags=["recommendations"])
 
+_MAX_PREVIOUS_COMBINATIONS = 20
+
+
+def _parse_combinations(raw: list[str] | None) -> list[frozenset[int]]:
+    """Parse ['12,45,78', '13,45,80'] into id sets. Empty entries are ignored.
+
+    A single field may also hold several combinations separated by ';'.
+
+    If every entry is a single ID (e.g. the field was repeated once per ID, as
+    array inputs in API GUIs tend to do), the IDs are treated as ONE
+    combination, since a one-item "outfit" list like that is almost always
+    meant as the previous outfit split into parts.
+    """
+    combos: list[frozenset[int]] = []
+    for entry in raw or []:
+        for part in entry.split(";"):
+            part = part.strip()
+            if not part:
+                continue
+            try:
+                ids = frozenset(int(x) for x in part.split(",") if x.strip())
+            except ValueError:
+                raise HTTPException(
+                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    detail=f"previous_combinations tidak valid: '{part}'. Gunakan format '12,45,78'.",
+                )
+            if ids:
+                combos.append(ids)
+    if len(combos) > 1 and all(len(c) == 1 for c in combos):
+        combos = [frozenset().union(*combos)]
+    if len(combos) > _MAX_PREVIOUS_COMBINATIONS:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"Maksimal {_MAX_PREVIOUS_COMBINATIONS} previous_combinations.",
+        )
+    return combos
+
 
 @router.post("", response_model=RecommendationResponse)
 async def create_recommendation(
@@ -42,6 +79,21 @@ async def create_recommendation(
         "mannequin",
         description="Mode visualisasi: 'mannequin' (siluet manekin) atau 'user_photo' (foto saya)",
     ),
+    refresh: bool = Form(
+        False,
+        description=(
+            "true jika pengguna ingin opsi lain. Kandidat diacak dan AI diminta memberi "
+            "kombinasi berbeda."
+        ),
+    ),
+    previous_combinations: list[str] | None = Form(
+        None,
+        description=(
+            "Kombinasi yang sudah pernah ditampilkan, format ID dipisah koma, mis. "
+            "'12,45,78' (ambil dari field 'combination' respons sebelumnya). Ulangi field "
+            "ini untuk beberapa kombinasi. Hasil dijamin tidak sama persis dengan kombinasi ini."
+        ),
+    ),
     db: Session = Depends(get_db),
 ):
     """Recommend an outfit from the real catalog within budget, with outfit preview."""
@@ -56,27 +108,21 @@ async def create_recommendation(
     except MoneyParseError as exc:
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc))
 
-    # Treat an empty upload (e.g. --form 'image=') as "no image".
-    has_image = image is not None and getattr(image, "filename", None)
+    excluded = _parse_combinations(previous_combinations)
 
-    if mode == "user_photo" and not has_image:
+    # Treat an empty upload (e.g. --form 'image=') as "no image".
+    user_bytes: bytes | None = None
+    user_mime = "image/jpeg"
+    if storage_service.has_upload(image):
+        try:
+            user_bytes, user_mime = await storage_service.read_image_upload(image)
+        except ValueError as exc:
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc))
+    elif mode == "user_photo":
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail="Mode 'user_photo' membutuhkan field 'image'.",
         )
-
-    # Validate and read the user photo if provided.
-    user_bytes: bytes | None = None
-    user_mime = "image/jpeg"
-    if has_image:
-        try:
-            storage_service.validate_image(image)
-            user_bytes = await image.read()
-            if not user_bytes:
-                raise ValueError("File gambar kosong.")
-        except ValueError as exc:
-            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc))
-        user_mime = (image.content_type or "image/jpeg").lower()
 
     repo = ItemRepository(db)
     try:
@@ -94,6 +140,8 @@ async def create_recommendation(
             budget=budget_value,
             extra_prompt=prompt,
             mode=mode,
+            refresh=refresh,
+            previous_combinations=excluded,
         )
     except Exception as exc:
         logger.exception("Recommendation failed")
@@ -123,6 +171,8 @@ async def create_recommendation(
         overall_reasoning=result["overall_reasoning"],
         photo_analysis=result.get("photo_analysis", ""),
         mode=mode,
+        combination=result["combination"],
+        notice=result["notice"],
         generated_image_path=generated_path,
         generated_image_url=storage_service.build_public_url(base_url, generated_path),
         image_editing_error=result["image_editing_error"],

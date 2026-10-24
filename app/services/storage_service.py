@@ -42,6 +42,25 @@ def validate_image(upload: UploadFile) -> str:
     return ALLOWED_IMAGE_TYPES[content_type]
 
 
+async def read_image_upload(upload: UploadFile) -> tuple[bytes, str]:
+    """Validate and read an uploaded image. Returns (bytes, mime).
+
+    Raises ValueError with a user-facing message if the upload is invalid.
+    """
+    validate_image(upload)
+    data = await upload.read()
+    if not data:
+        raise ValueError("File gambar kosong.")
+    if len(data) > MAX_IMAGE_BYTES:
+        raise ValueError("Ukuran gambar melebihi batas 10 MB.")
+    return data, (upload.content_type or "image/jpeg").lower()
+
+
+def has_upload(upload: UploadFile | None) -> bool:
+    """True if a real file was sent (an empty form field like 'image=' is not)."""
+    return upload is not None and bool(getattr(upload, "filename", None))
+
+
 def save_item_bytes(data: bytes, ext: str) -> str:
     """Save already-read item image bytes and return the public-relative path."""
     if len(data) == 0:

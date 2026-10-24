@@ -9,7 +9,7 @@ from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 
 from app.config import settings
-from app.routers import categories, items, recommendations
+from app.routers import categories, items, outfits, recommendations
 from app.services import composite_service, storage_service
 
 logging.basicConfig(level=logging.INFO)
@@ -50,6 +50,7 @@ app.mount("/public", StaticFiles(directory=settings.public_dir), name="public")
 app.include_router(categories.router)
 app.include_router(items.router)
 app.include_router(recommendations.router)
+app.include_router(outfits.router)
 
 
 @app.get("/", tags=["meta"])

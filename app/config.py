@@ -18,8 +18,12 @@ class Settings(BaseSettings):
     # Reasoning depth for Gemini 3.x models: minimal/low/medium/high. Lower is
     # faster. Leave empty to use the model default.
     gemini_thinking_level: str = "low"
-    # Per-request timeout so a slow Gemini call never hangs the API.
-    gemini_timeout_sec: int = 30
+    # Comma-separated backup text models, tried in order when the main model
+    # times out or is overloaded (503/504/429).
+    gemini_fallback_models: str = "gemini-3.1-flash-lite,gemini-3.5-flash-lite"
+    # Per-model timeout so a stuck Gemini model never hangs the API; on timeout
+    # the next fallback model is tried.
+    gemini_timeout_sec: int = 15
     # Max candidate items per category sent to Gemini (keeps the prompt small).
     reco_max_per_category: int = 8
 

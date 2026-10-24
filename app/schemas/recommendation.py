@@ -23,6 +23,16 @@ class RecommendationResponse(BaseModel):
         "", description="AI (Gemini Vision) analysis of the uploaded photo"
     )
     mode: str = Field("mannequin", description="Visualization mode used: mannequin or user_photo")
+    combination: list[int] = Field(
+        default_factory=list,
+        description=(
+            "ID item kombinasi ini (terurut). Kirim kembali sebagai "
+            "'previous_combinations' saat refresh agar kombinasi ini tidak diulang."
+        ),
+    )
+    notice: str | None = Field(
+        None, description="Catatan tambahan, mis. jika tidak ada kombinasi baru yang tersedia"
+    )
     generated_image_path: str | None = Field(
         None, description="Relative path of the composed outfit preview, null if it failed"
     )
