@@ -104,6 +104,8 @@ _SLOT_WORDS: dict[str, set[str]] = {
 # Words that ask for a whole look rather than a single item.
 _FULL_OUTFIT_WORDS = {"outfit", "setelan", "paket", "lengkap", "look", "penampilan", "pakaian"}
 _ALL_ACCESSORY_WORDS = {"aksesori", "aksesoris", "accessory", "accessories"}
+# Words that restrict the request to the product types that are named.
+_ONLY_WORDS = {"aja", "saja", "doang", "hanya", "cuma", "cuman", "only", "just"}
 _SLOT_LABELS = {
     "upper": "1 atasan",
     "lower": "1 bawahan",
@@ -124,7 +126,10 @@ def requested_slots(extra_prompt: str | None) -> set[str]:
     slots = {s for s, ws in _SLOT_WORDS.items() if words & ws}
     if words & _ALL_ACCESSORY_WORDS:
         slots |= {"accessory:topi", "accessory:kacamata"}
-    if not slots or words & _FULL_OUTFIT_WORDS:
+    # "outfit ... atasan aja" means ONLY a top: a restricting word overrides
+    # the "whole outfit" reading when specific product types are named.
+    only = bool(words & _ONLY_WORDS) and bool(slots)
+    if not slots or (words & _FULL_OUTFIT_WORDS and not only):
         slots |= set(_CORE_SLOTS)
     return slots
 
