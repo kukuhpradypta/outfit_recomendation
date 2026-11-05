@@ -135,11 +135,13 @@ def _remove_bg_threshold(img: Image.Image, thresh: int = 238) -> Image.Image:
     return img
 
 
-def _keep_largest_component(img: Image.Image) -> Image.Image:
-    """Keep only the largest opaque blob, dropping stray marks (e.g. watermarks).
+def _keep_largest_component(img: Image.Image, min_ratio: float = 1.0) -> Image.Image:
+    """Keep the largest opaque blob, dropping stray marks (e.g. watermarks).
 
     Works on the alpha channel: label connected non-transparent regions and
-    keep the biggest one. Falls back to the original image on any error.
+    keep the biggest one, plus any other region at least `min_ratio` of its
+    size (so both shoes of a pair survive while small text is dropped).
+    Falls back to the original image on any error.
     """
     try:
         import numpy as np
@@ -155,8 +157,8 @@ def _keep_largest_component(img: Image.Image) -> Image.Image:
             return img
         # Find the largest labeled component.
         sizes = ndimage.sum(mask, labeled, range(1, n + 1))
-        largest = int(np.argmax(sizes)) + 1
-        keep = labeled == largest
+        big = [k + 1 for k, s in enumerate(sizes) if s >= sizes.max() * min_ratio]
+        keep = np.isin(labeled, big)
         arr[:, :, 3] = np.where(keep, alpha, 0)
         return Image.fromarray(arr, "RGBA")
     except Exception as exc:  # scipy/numpy missing or any failure
@@ -184,7 +186,8 @@ def _cutout(img: Image.Image) -> Image.Image:
     if result is None:
         result = _remove_bg_threshold(img)
     result = _clean_edges(result)
-    result = _keep_largest_component(result)
+    # Keep big parts too: a pair of shoes is two separate blobs.
+    result = _keep_largest_component(result, min_ratio=0.25)
     bbox = result.getbbox()
     if bbox:
         result = result.crop(bbox)
@@ -288,6 +291,11 @@ def _base_canvas_user(user_image: bytes) -> tuple[Image.Image, tuple[int, int, i
     return canvas, box
 
 
+def _is_shorts(piece: OutfitPiece) -> bool:
+    words = set(f"{piece.category_name} {piece.name}".lower().split())
+    return any(w in words for w in SHORTS_WORDS)
+
+
 def _is_glasses(piece: OutfitPiece) -> bool:
     name = f"{piece.category_name} {piece.name}".lower()
     return any(k in name for k in ("kacamata", "glasses", "sunglasses"))
@@ -299,14 +307,94 @@ REF_W = 300                 # reference width of the top garment
 HEAD_R_RATIO = 0.155        # head radius = W * ratio
 NECK_H_RATIO = 0.035        # visible neck height = W * ratio
 PANTS_W_RATIO = 0.68        # pants width vs top width (hips < shoulders)
-SHOE_W_RATIO = 0.64         # width of the shoe pair vs top width
 TUCK_RATIO = 0.07           # pants waist overlaps top hem by this * top height
-SHOE_OVERLAP_RATIO = 0.38   # pants hem covers this share of the shoe height
 PANTS_MAX_H_RATIO = 1.38    # pants height cap vs top height (natural leg length)
 PANTS_MIN_H_RATIO = 1.15    # pants height floor vs top height
 FIG_MARGIN_TOP = 40
 FIG_MARGIN_BOTTOM = 30      # gap kept above the caption bar
 CAPTION_H = 46
+
+
+SHOE_EACH_W_RATIO = 0.30    # width of ONE shoe vs top width
+SHOE_SQUASH = 0.62          # vertical squash: top-down product shots read as feet seen from the front
+SHOE_MAX_H_RATIO = 0.26     # height cap of one shoe vs top width
+SHOE_TUCK = 0.15            # share of the shoe height hidden under the pants hem
+SHORTS_H_RATIO = 0.62       # shorts height vs top height (legs show below)
+SHORTS_WORDS = ("pendek", "short", "shorts")
+
+
+def _split_shoes(img: Image.Image) -> tuple[Image.Image, Image.Image]:
+    """Return (left, right) shoe images.
+
+    Product photos show either a pair (two blobs) or a single shoe. A single
+    shoe is mirrored to make the left foot.
+    """
+    parts: list[tuple[int, Image.Image]] = []
+    try:
+        import numpy as np
+        from scipy import ndimage
+
+        alpha = np.array(img.getchannel("A")) > 25
+        labeled, n = ndimage.label(alpha)
+        if n >= 2:
+            sizes = ndimage.sum(alpha, labeled, range(1, n + 1))
+            order = sorted(range(n), key=lambda k: sizes[k], reverse=True)[:2]
+            if sizes[order[1]] >= sizes[order[0]] * 0.25:
+                for k in order:
+                    sl = ndimage.find_objects((labeled == k + 1).astype(int))[0]
+                    y0, y1, x0, x1 = sl[0].start, sl[0].stop, sl[1].start, sl[1].stop
+                    piece = img.crop((x0, y0, x1, y1))
+                    mask = Image.fromarray(((labeled[y0:y1, x0:x1] == k + 1) * 255).astype("uint8"))
+                    piece.putalpha(Image.fromarray(np.minimum(
+                        np.array(piece.getchannel("A")), np.array(mask))))
+                    parts.append((x0, piece))
+    except Exception as exc:
+        logger.warning("Pemisahan sepatu dilewati: %s", exc)
+    if len(parts) == 2:
+        parts.sort(key=lambda p: p[0])
+        return parts[0][1], parts[1][1]
+
+    # Pairs that touch form one blob: split at the emptiest column near the middle.
+    try:
+        import numpy as np
+
+        cols = (np.array(img.getchannel("A")) > 25).sum(axis=0)
+        lo, hi = int(len(cols) * 0.3), int(len(cols) * 0.7)
+        if hi > lo and cols.max() > 0:
+            cut = lo + int(np.argmin(cols[lo:hi]))
+            if cols[cut] <= cols.max() * 0.2:
+                left, right = img.crop((0, 0, cut, img.height)), img.crop((cut, 0, img.width, img.height))
+                left, right = left.crop(left.getbbox()), right.crop(right.getbbox())
+                return left, right
+    except Exception as exc:
+        logger.warning("Pemisahan sepatu dilewati: %s", exc)
+    from PIL import ImageOps
+
+    return ImageOps.mirror(img), img
+
+
+def _shoe_pair(img: Image.Image, each_w: int, max_h: int) -> tuple[Image.Image, Image.Image]:
+    """Scale both shoes to the same size, foreshortened like feet seen from the front."""
+    left, right = _split_shoes(img)
+    out = []
+    for shoe in (left, right):
+        w = each_w
+        h = int(shoe.height * (each_w / shoe.width) * SHOE_SQUASH)
+        if h > max_h:
+            w, h = int(w * max_h / h), max_h
+        out.append(shoe.resize((max(1, w), max(1, h)), Image.LANCZOS))
+    # Same height for both feet so the pair looks level.
+    h = min(o.height for o in out)
+    out = [o.resize((max(1, int(o.width * h / o.height)), h), Image.LANCZOS) for o in out]
+    return out[0], out[1]
+
+
+def _paste_shoes(canvas: Image.Image, pair: tuple[Image.Image, Image.Image],
+                 cx: int, gap: int, top_y: int) -> None:
+    """Paste the pair centred on the two legs (leg centres at cx ± gap)."""
+    left, right = pair
+    canvas.paste(left, (cx - gap - left.width // 2, top_y), left)
+    canvas.paste(right, (cx + gap - right.width // 2, top_y), right)
 
 
 def _scale_to_height(img: Image.Image, target_h: int) -> Image.Image:
@@ -318,6 +406,7 @@ def _compose_on_mannequin(pieces: list[OutfitPiece]) -> Image.Image:
     """Stack garments head-to-toe, draw a mannequin fitted behind them, then
     scale the whole figure to fit the frame (nothing can be cut off)."""
     W = REF_W
+    shorts = False
     tops: dict[str, Image.Image] = {}
     head_items: list[tuple[OutfitPiece, Image.Image]] = []
     side_items: list[Image.Image] = []
@@ -327,7 +416,10 @@ def _compose_on_mannequin(pieces: list[OutfitPiece]) -> Image.Image:
         if img is None:
             continue
         if zone in ("upper", "outer", "lower", "feet"):
-            tops.setdefault(zone, img)
+            if zone not in tops:
+                tops[zone] = img
+                if zone == "lower":
+                    shorts = _is_shorts(piece)
         elif zone == "head":
             head_items.append((piece, img))
         else:
@@ -344,14 +436,24 @@ def _compose_on_mannequin(pieces: list[OutfitPiece]) -> Image.Image:
         # Keep a natural torso:leg ratio regardless of the product photo.
         max_h = int(top_h * PANTS_MAX_H_RATIO)
         min_h = int(top_h * PANTS_MIN_H_RATIO)
-        if pants.height > max_h:
+        if shorts:
+            # Shorts end above the knee; the bare legs are drawn below them.
+            if pants.height > int(top_h * SHORTS_H_RATIO):
+                pants = _scale_to_height(pants, int(top_h * SHORTS_H_RATIO))
+        elif pants.height > max_h:
             pants = _scale_to_height(pants, max_h)
         elif pants.height < min_h:
             pants = _scale_to_height(pants, min_h)
-    pants_h = pants.height if pants else int(top_h * 1.45)
+    # Leg length stays natural even when the bottom is short.
+    pants_h = pants.height if pants and not shorts else int(top_h * 1.3)
 
-    shoes = _fit_cover_width(tops["feet"], int(W * SHOE_W_RATIO)) if "feet" in tops else None
-    shoe_h = shoes.height if shoes else int(W * 0.18)
+    # Leg centres sit about a quarter of the pants width from the middle.
+    leg_gap = int((pants.width if pants else W * 0.5) * 0.25)
+    shoes = None
+    if "feet" in tops:
+        each_w = min(int(W * SHOE_EACH_W_RATIO), int(leg_gap * 1.9))
+        shoes = _shoe_pair(tops["feet"], each_w, int(W * SHOE_MAX_H_RATIO))
+    shoe_h = shoes[0].height if shoes else int(W * 0.18)
 
     head_r = int(W * HEAD_R_RATIO)
     neck_h = int(W * NECK_H_RATIO)
@@ -363,7 +465,7 @@ def _compose_on_mannequin(pieces: list[OutfitPiece]) -> Image.Image:
     top_bottom = top_y + top_h
     pants_y = top_bottom - int(top_h * TUCK_RATIO)
     pants_bottom = pants_y + pants_h
-    shoe_y = pants_bottom - int(shoe_h * SHOE_OVERLAP_RATIO)
+    shoe_y = pants_bottom - int(shoe_h * SHOE_TUCK)
     fig_h = shoe_y + shoe_h
 
     widths = [W, int(W * 1.1)]
@@ -384,10 +486,10 @@ def _compose_on_mannequin(pieces: list[OutfitPiece]) -> Image.Image:
                (fcx + torso_half, top_y + int(top_h * 0.10)),
                (fcx + int(torso_half * 0.9), top_bottom),
                (fcx - int(torso_half * 0.9), top_bottom)], fill=MANNEQUIN_COLOR)
-    if pants is None:
-        leg_half = int(W * 0.10)
+    if pants is None or shorts:
+        leg_half = int(W * 0.09)
         for sx in (-1, 1):
-            lx = fcx + sx * int(W * 0.12)
+            lx = fcx + sx * leg_gap
             d.polygon([(lx - leg_half, pants_y), (lx + leg_half, pants_y),
                        (lx + int(leg_half * 0.7), shoe_y + 10),
                        (lx - int(leg_half * 0.7), shoe_y + 10)], fill=MANNEQUIN_COLOR)
@@ -396,7 +498,7 @@ def _compose_on_mannequin(pieces: list[OutfitPiece]) -> Image.Image:
 
     # --- garments: shoes, pants, top, outer (so the top covers the pants waist)
     if shoes:
-        fig.paste(shoes, (fcx - shoes.width // 2, shoe_y), shoes)
+        _paste_shoes(fig, shoes, fcx, leg_gap, shoe_y)
     if pants:
         fig.paste(pants, (fcx - pants.width // 2, pants_y), pants)
     if top:
@@ -450,6 +552,7 @@ def _compose_on_user_photo(pieces: list[OutfitPiece], user_image: bytes) -> Imag
     cx = (l + r) // 2
 
     cuts: dict[str, Image.Image] = {}
+    shorts = False
     head_items: list[tuple[OutfitPiece, Image.Image]] = []
     side_items: list[Image.Image] = []
     for piece in pieces:
@@ -458,7 +561,10 @@ def _compose_on_user_photo(pieces: list[OutfitPiece], user_image: bytes) -> Imag
         if img is None:
             continue
         if zone in ("upper", "outer", "lower", "feet"):
-            cuts.setdefault(zone, img)
+            if zone not in cuts:
+                cuts[zone] = img
+                if zone == "lower":
+                    shorts = _is_shorts(piece)
         elif zone == "head":
             head_items.append((piece, img))
         else:
@@ -470,14 +576,17 @@ def _compose_on_user_photo(pieces: list[OutfitPiece], user_image: bytes) -> Imag
     top = _scale_to_height(top_img, top_h) if top_img else None
     ref_w = top.width if top else int(h * 0.30)
 
-    if "feet" in cuts:
-        shoes = _fit_cover_width(cuts["feet"], int(ref_w * SHOE_W_RATIO))
-        if shoes.height > int(h * 0.09):
-            shoes = _scale_to_height(shoes, int(h * 0.09))
-        canvas.paste(shoes, (cx - shoes.width // 2, b - shoes.height), shoes)
+    pants = None
     if "lower" in cuts:
+        leg_len = (PHOTO_ANKLE_Y - PHOTO_WAIST_Y) * h
+        pants = _scale_to_height(cuts["lower"], int(leg_len * (0.45 if shorts else 1.0)))
+    if "feet" in cuts:
+        leg_gap = int((pants.width if pants else ref_w * 0.5) * 0.25)
+        each_w = min(int(ref_w * SHOE_EACH_W_RATIO), int(leg_gap * 1.9))
+        pair = _shoe_pair(cuts["feet"], each_w, int(h * 0.07))
+        _paste_shoes(canvas, pair, cx, leg_gap, b - pair[0].height)
+    if pants:
         waist_y = t + int(PHOTO_WAIST_Y * h)
-        pants = _scale_to_height(cuts["lower"], int((PHOTO_ANKLE_Y - PHOTO_WAIST_Y) * h))
         canvas.paste(pants, (cx - pants.width // 2, waist_y), pants)
     if top:
         canvas.paste(top, (cx - top.width // 2, collar_y), top)
