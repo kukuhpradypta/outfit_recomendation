@@ -5,6 +5,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 
@@ -40,6 +41,15 @@ app = FastAPI(
     # Nonaktifkan Swagger UI & ReDoc bawaan; /docs dipakai Scalar.
     docs_url=None,
     redoc_url=None,
+)
+
+# CORS: izinkan frontend Flutter web (port localhost acak saat dev).
+app.add_middleware(
+    CORSMiddleware,
+    allow_origin_regex=r"https?://(localhost|127\.0\.0\.1)(:\d+)?",
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 # Serve uploaded and generated images.
